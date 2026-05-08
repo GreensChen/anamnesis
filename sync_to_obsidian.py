@@ -24,8 +24,38 @@ from pathlib import Path
 
 VAULT_ROOT = Path.home() / "Dropbox" / "Greens Obsidian"
 TRANSCRIPTS_DIR = VAULT_ROOT / "1 Sources" / "Transcripts"
+INTERVIEWS_DIR = VAULT_ROOT / "1 Sources" / "Interviews"
 HIGHLIGHTS_DIR = VAULT_ROOT / "1 Sources" / "Highlights"
 KOBO_HIGHLIGHTS_SOURCE = Path.home() / "Dropbox" / "Kobo Highlights"
+
+
+_TRANSCRIPT_META_TAGS = {"transcript", "yt2epub"}
+_INTERVIEW_META_TAGS = {"interview", "overview"}
+
+
+def _read_topical_from(path: Path, exclude: set) -> list:
+    if not path.exists():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        return []
+    m = re.search(r"^tags:\s*\[(.*?)\]\s*$", text, re.MULTILINE)
+    if not m:
+        return []
+    tags = [t.strip() for t in m.group(1).split(",") if t.strip()]
+    return [t for t in tags if t not in exclude]
+
+
+def _existing_topical_tags(path: Path) -> list:
+    """既有 transcript file 的 topical tag。"""
+    return _read_topical_from(path, _TRANSCRIPT_META_TAGS)
+
+
+def _interview_topical_tags(safe_title: str) -> list:
+    """同名 Interview overview 的 topical tag — 1:1 配對、用 interview 那邊的當權威。"""
+    iv = INTERVIEWS_DIR / f"{safe_title}.md"
+    return _read_topical_from(iv, _INTERVIEW_META_TAGS)
 
 
 def _safe_filename(name: str) -> str:
@@ -90,7 +120,17 @@ def render_transcript(data: dict) -> str:
             role = p.get("role", "")
             label = f"{name}" if not role else f"{name} — {role}"
             fm.append(f"  - {_yaml_str(label)}")
-    fm.append("tags: [transcript, yt2epub]")
+    # 抓 topical tags：優先從同名 Interview overview 抄（更精準、1:1 配對）；
+    # 沒 Interview 才 fallback 用既有 transcript 的 topical（避免重 sync 弄丟）
+    safe_filename = _safe_filename(title)
+    iv_topical = _interview_topical_tags(safe_filename)
+    if iv_topical:
+        topical = iv_topical
+    else:
+        topical = _existing_topical_tags(TRANSCRIPTS_DIR / f"{safe_filename}.md")
+    base_tags = ["transcript", "yt2epub"]
+    all_tags = base_tags + [t for t in topical if t not in base_tags]
+    fm.append(f"tags: [{', '.join(all_tags)}]")
     fm.append("---")
     fm.append("")
 
@@ -99,7 +139,14 @@ def render_transcript(data: dict) -> str:
         body.append(f"*{podcast}*  ·  {date}".strip())
     if url:
         body.append(f"\n[原始影片]({url})")
-    # 連到對應的 Highlights（如果有畫過重點的話）
+    # 連到對應的 Interview overview（每個 transcript 都對應一個 Interview）
+    safe_title = _safe_filename(title)
+    interview_path = INTERVIEWS_DIR / f"{safe_title}.md" if INTERVIEWS_DIR.exists() else None
+    if interview_path and interview_path.exists():
+        body.append(
+            f"> 📋 對談速覽: [[1 Sources/Interviews/{safe_title}|{safe_title}]]"
+        )
+    # 連到對應的 Highlights（如果有畫過重點）
     hl_stem = _find_matching_highlight(title)
     if hl_stem:
         body.append(
