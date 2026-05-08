@@ -1,0 +1,25 @@
+# 敏感
+.env
+
+# State (server-local)
+review_state.json
+
+# 執行紀錄
+*.log
+*.stdout.log
+*.stderr.log
+consolidate_vocab*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+.claude/
