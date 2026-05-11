@@ -549,6 +549,119 @@ def save_screenshots_as_article(
     }
 
 
+# ─────────────────────────────────────────────
+# 長文 + 截圖 metadata 合併模式
+# ─────────────────────────────────────────────
+
+COMBINED_TEXT_SCREENSHOT_USER_PROMPT = """使用者複製了一篇長文，另外補了一張截圖顯示發文者 / 平台資訊。
+
+請從截圖辨識發文者和平台，並從文字內容產出摘要。
+
+輸出格式（嚴格遵守，不要輸出原文）：
+
+發文者：姓名 (@handle, 平台名)
+平台：平台名
+標題：（用內文濃縮一個短標題、不含特殊字元 / 引號 / hashtag）
+
+## 摘要
+
+（1 段、80-150 字。純概括文章核心內容、不評論不延伸。不要含 hashtag）
+
+如果發文者看不出來就寫「發文者：（不詳）」。
+只輸出上述內容，不要輸出原文。
+
+---
+
+文章內文：
+
+{text}
+
+{caption_block}
+"""
+
+
+def save_text_with_metadata_screenshot(
+    text: str, image: bytes, caption: str = "",
+) -> dict:
+    """長文 + 一張 metadata 截圖 → 合併成 post 格式存 vault。"""
+    from google.genai import types
+
+    client = _get_gemini_client()
+    caption_block = (
+        f"使用者補充：\n{caption}" if caption.strip() else ""
+    )
+    prompt_text = COMBINED_TEXT_SCREENSHOT_USER_PROMPT.format(
+        text=text[:60000],
+        caption_block=caption_block,
+    )
+    parts = [
+        types.Part.from_bytes(data=image, mime_type="image/jpeg"),
+        types.Part(text=prompt_text),
+    ]
+    config = types.GenerateContentConfig(
+        system_instruction=SCREENSHOT_SYSTEM_PROMPT,
+        max_output_tokens=2048,
+        thinking_config=types.ThinkingConfig(thinking_budget=1024),
+    )
+    resp = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=types.Content(parts=parts),
+        config=config,
+    )
+    raw = (resp.text or "").strip()
+    if not raw:
+        raise RuntimeError("Gemini 回傳空")
+
+    raw = _strip_inline_hashtags(raw)
+    poster, platform, title, summary_body = _extract_poster_meta(raw)
+    if not title:
+        first_line = text.strip().split("\n", 1)[0].strip()
+        title = first_line[:40] or f"post-{datetime.now().strftime('%Y%m%d-%H%M')}"
+
+    safe_title = _safe_filename(title)
+    captured_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    topical = _topical_tags_via_vocab(
+        summary_body + "\n" + text[:5000], safe_title + ".md",
+    )
+
+    fm = [
+        "---",
+        "type: post",
+        f"title: {_yaml_str(title)}",
+        f"poster: {_yaml_str(poster)}",
+        f"platform: {_yaml_str(platform)}",
+        f"captured_at: {_yaml_str(captured_at)}",
+        _build_tags_line(["post", "capture"], topical),
+        "generated_by: gemini",
+        "---",
+        "",
+        f"# {title}",
+    ]
+    meta_lines = []
+    if poster:
+        meta_lines.append(f"**發文者**：{poster}")
+    if platform:
+        meta_lines.append(f"**平台**：{platform}")
+    fm.extend(meta_lines)
+    fm.append("")
+    if caption.strip():
+        fm.append(f"> 📌 補充：{caption.strip()}")
+        fm.append("")
+    if summary_body.strip():
+        fm.append(summary_body.strip())
+        fm.append("")
+    fm.append("---")
+    fm.append("")
+    fm.append("## 內文")
+    fm.append("")
+    fm.append(text.strip())
+
+    md = "\n".join(fm)
+    remote_path = f"{DROPBOX_VAULT_ARTICLES_PATH}/{safe_title}.md"
+    _upload_md(remote_path, md)
+    return {"title": title, "poster": poster, "remote_path": remote_path}
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:

@@ -3,16 +3,10 @@
 obsidian_bot.py — Obsidian 知識庫 Telegram bot（跟 yt2epub bot 分開）
 
 職責：
-- /review 流程：拉 Dropbox `/Kobo Highlights/` 未 process 的 highlight，
-  一條一條卡片推 user → user 文字 reaction → 寫 `/Obsidian/0 Inbox/`
-- /skipall：把所有 pending 標記為已處理（清歷史用）
-- /pausereview：暫停當前 review batch
-- 22:00 daily digest：推送 pending highlights 數量提醒
-
-未來會擴：
-- 原生靈感（散步/洗澡/對話冒出）→ Telegram 文字 → 直接進 Obsidian
-- 網路文章連結 → 摘要 + 存 Obsidian Inbox
-- vault-aware AI 對話（撈 related notes、提問挑戰）
+- /chat：discussion ↔ capture mode toggle、vault-aware AI 對話
+- /review：手動 review 所有 pending Kobo highlights
+- 22:00 daily review：推送 highlight 回顧卡片（最多 10 張、同一本書優先）
+- capture：YouTube URL / 網頁 URL / 截圖 / 長文 / spark 自動分流存 vault
 
 啟動：
     python3 obsidian_bot.py
@@ -63,6 +57,7 @@ BASE_DIR = Path(__file__).parent
 LOG_FILE = BASE_DIR / "obsidian_bot.log"
 
 DAILY_REVIEW_DIGEST_HOUR = int(os.environ.get("DAILY_REVIEW_DIGEST_HOUR", "22"))
+DAILY_REVIEW_MAX_CARDS = 10
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -82,12 +77,16 @@ def html_escape(s: str) -> str:
 
 _review_state: dict[int, dict] = {}
 _quiz_state: dict[int, dict] = {}
-# 多輪對話 state — /ask 啟動、user 直接打字接續、Gemini 自己偵測結束
+# 多輪對話 state
 _chat_state: dict[int, dict] = {}
+# chat mode toggle（discussion vs capture）
+_chat_mode: set[int] = set()
+# 長文等截圖的暫存 — 貼長文後補一張截圖可以抓 metadata
+_pending_long_text: dict[int, dict] = {}
+PENDING_TEXT_TIMEOUT_SEC = 120
 # Telegram 多張截圖會用 media_group_id 串起來、分多次 update 進來。
-# 累積在這裡、用 1.5s debounce 收齊再一次 process。
 _pending_media_groups: dict[str, dict] = {}
-MEDIA_GROUP_DEBOUNCE_SEC = 1.5
+MEDIA_GROUP_DEBOUNCE_SEC = 3.0
 
 
 async def _push_review_card(chat_id: int, bot):
@@ -99,7 +98,7 @@ async def _push_review_card(chat_id: int, bot):
         total = len(state["pending"])
         del _review_state[chat_id]
         await bot.send_message(
-            chat_id, f"✅ 本輪 review 完成（{total} 條）。"
+            chat_id, f"✅ 本輪回顧完成（{total} 條）。"
         )
         return
 
@@ -108,21 +107,21 @@ async def _push_review_card(chat_id: int, bot):
     text_lines = [
         f"📖 <b>{html_escape(h.book_title)}</b>",
     ]
-    if h.author:
-        text_lines.append(f"👤 {html_escape(h.author)}")
-    text_lines.append(f"🕒 {h.timestamp}  ({state['idx']+1}/{total})")
+    if h.chapter:
+        text_lines.append(f"📑 {html_escape(h.chapter)}")
+    text_lines.append(f"({state['idx']+1}/{total})")
     text_lines.append("")
     text_lines.append(f"<blockquote>{html_escape(h.text)}</blockquote>")
     if h.note:
         text_lines.append(f"\n📝 原筆記：{html_escape(h.note)}")
-    text_lines.append("\n💭 你的反應？（直接打字，或用按鈕）")
 
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("⏭ 跳過", callback_data="rev:skip"),
-            InlineKeyboardButton("⏸ 全部之後", callback_data="rev:pause"),
-        ],
-    ])
+    buttons = [
+        InlineKeyboardButton("💭 補想法", callback_data="rev:react"),
+        InlineKeyboardButton("✓ 讀過了", callback_data="rev:read"),
+    ]
+    if state.get("source") == "manual":
+        buttons.append(InlineKeyboardButton("⏸ 暫停", callback_data="rev:pause"))
+    kb = InlineKeyboardMarkup([buttons])
     msg = await bot.send_message(
         chat_id,
         "\n".join(text_lines),
@@ -130,7 +129,7 @@ async def _push_review_card(chat_id: int, bot):
         reply_markup=kb,
     )
     state["current_msg_id"] = msg.message_id
-    state["awaiting_text"] = True
+    state["awaiting_text"] = False
 
 
 # ─────────────────────────────────────────────
@@ -142,10 +141,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 <b>Obsidian bot 上線</b>\n\n"
         "我負責處理你的 Kobo highlights、之後也會接原生靈感跟網路文章。\n\n"
         "<b>常用指令：</b>\n"
-        "• /review — 開始 process pending Kobo highlights\n"
-        "• /skipall — 把所有 pending 標為已處理（清歷史用）\n"
-        "• /pausereview — 暫停當前 review batch\n\n"
-        "yt2epub 那支 bot 不變，繼續處理影片連結 → epub。"
+        "• /chat — 切換 discussion ↔ capture mode（帶問題直接問）\n"
+        "• /review — 手動 review 所有 pending highlights\n"
+        "• /skipall — 把所有 pending 標為已處理\n"
+        "• /quiz — active recall 出題\n\n"
+        f"每天 {DAILY_REVIEW_DIGEST_HOUR}:00 自動推送 highlight 回顧卡片。"
     )
 
 
@@ -180,6 +180,7 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "idx": 0,
         "awaiting_text": False,
         "current_msg_id": None,
+        "source": "manual",
     }
     book_count = len({h.book_filename for h in pending})
     await update.message.reply_html(
@@ -241,33 +242,12 @@ async def cmd_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _push_quiz_card(chat_id, context.bot)
 
 
-async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/ask <question> — 啟動多輪對話。之後直接打字接續、Gemini 偵測「先這樣吧」自動結束。"""
-    if not context.args:
-        await update.message.reply_text(
-            "用法：/ask <問題>\n\n"
-            "啟動後直接打字繼續對話、不用每輪打 /ask。想結束打 /endchat、"
-            "bot 會給整段摘要 + 存進 vault。\n\n"
-            "例：\n"
-            "  /ask 從我讀的書，你看出我關心什麼\n"
-            "  /ask 我的盲點是什麼"
-        )
-        return
-
-    question = " ".join(context.args).strip()
+async def _start_chat_with_question(update: Update, question: str):
+    """進入 discussion mode 並發問。"""
     chat_id = update.effective_chat.id
+    _chat_mode.add(chat_id)
 
-    # 已在 chat 中又打 /ask → 把現在的存掉、起新對話
-    if chat_id in _chat_state:
-        try:
-            await asyncio.to_thread(
-                _save_current_chat, chat_id, end_summary="（被新 /ask 打斷）",
-            )
-        except Exception:
-            pass
-        _chat_state.pop(chat_id, None)
-
-    progress = await update.message.reply_text("🧠 讀你 vault 中（首次需要 5-10 秒）...")
+    progress = await update.message.reply_text("🧠 讀你 vault 中...")
 
     try:
         from chat_engine import build_first_user_turn, chat_turn
@@ -275,22 +255,83 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         history = [{"role": "user", "text": first_user_text}]
         answer = await asyncio.to_thread(chat_turn, history)
     except Exception as e:
-        logger.exception("/ask failed")
+        logger.exception("chat start failed")
         await progress.edit_text(f"❌ 失敗：{e}")
         return
 
     history.append({"role": "model", "text": answer})
     await progress.delete()
 
-    # 進入持續對話狀態
     _chat_state[chat_id] = {
         "history": history,
         "started_at": datetime.now(),
     }
     await _reply_long(update, answer)
-    await update.message.reply_html(
-        "💬 <i>對話中、之後直接打字接續、/endchat 結束並存 vault</i>"
-    )
+
+
+async def _exit_chat_mode(update: Update):
+    """退出 discussion mode：有對話就摘要存 vault、沒有就直接退。"""
+    chat_id = update.effective_chat.id
+    state = _chat_state.get(chat_id)
+
+    if state:
+        progress = await update.message.reply_text("✍️ 寫摘要中...")
+        try:
+            from chat_engine import generate_end_summary, save_conversation_log
+            summary = await asyncio.to_thread(generate_end_summary, state["history"])
+            remote_path = await asyncio.to_thread(
+                save_conversation_log,
+                state["history"], state["started_at"], summary,
+            )
+        except Exception as e:
+            logger.exception("chat exit failed")
+            await progress.edit_text(f"❌ 收尾失敗：{e}")
+            _chat_state.pop(chat_id, None)
+            _chat_mode.discard(chat_id)
+            return
+        _chat_state.pop(chat_id, None)
+        _chat_mode.discard(chat_id)
+        await progress.delete()
+        await _reply_long(update, summary)
+        await update.message.reply_html(
+            f"📥 回到 capture mode。對話已存：<code>{html_escape(remote_path)}</code>"
+        )
+    else:
+        _chat_mode.discard(chat_id)
+        await update.message.reply_text("📥 回到 capture mode。")
+
+
+async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/chat — toggle discussion ↔ capture mode。帶問題 = 進 discussion + 直接問。"""
+    chat_id = update.effective_chat.id
+
+    if chat_id in _chat_mode:
+        await _exit_chat_mode(update)
+        return
+
+    question = " ".join(context.args).strip() if context.args else ""
+
+    if chat_id in _chat_state:
+        try:
+            await asyncio.to_thread(
+                _save_current_chat, chat_id, end_summary="（被新對話打斷）",
+            )
+        except Exception:
+            pass
+        _chat_state.pop(chat_id, None)
+
+    if question:
+        await _start_chat_with_question(update, question)
+    else:
+        _chat_mode.add(chat_id)
+        await update.message.reply_html(
+            "🧠 <b>Discussion mode</b> — 直接打字開始對話、/chat 結束並存 vault。"
+        )
+
+
+async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/ask — legacy alias for /chat。"""
+    await cmd_chat(update, context)
 
 
 async def _reply_long(update: Update, text: str):
@@ -353,33 +394,12 @@ async def _continue_chat(update: Update, text: str):
 
 
 async def cmd_endchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/endchat — 結束當前對話、Gemini 給摘要、存 vault。"""
+    """/endchat — legacy alias：結束 discussion mode。"""
     chat_id = update.effective_chat.id
-    state = _chat_state.get(chat_id)
-    if not state:
+    if chat_id not in _chat_mode and chat_id not in _chat_state:
         await update.message.reply_text("（沒在對話中）")
         return
-
-    progress = await update.message.reply_text("✍️ 寫摘要中...")
-    try:
-        from chat_engine import generate_end_summary, save_conversation_log
-        summary = await asyncio.to_thread(generate_end_summary, state["history"])
-        remote_path = await asyncio.to_thread(
-            save_conversation_log,
-            state["history"], state["started_at"], summary,
-        )
-    except Exception as e:
-        logger.exception("/endchat failed")
-        await progress.edit_text(f"❌ 收尾失敗：{e}")
-        return
-    finally:
-        _chat_state.pop(chat_id, None)
-
-    await progress.delete()
-    await _reply_long(update, summary)
-    await update.message.reply_html(
-        f"✅ 對話收尾、存：<code>{html_escape(remote_path)}</code>"
-    )
+    await _exit_chat_mode(update)
 
 
 async def cmd_endquiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -515,14 +535,14 @@ async def cmd_skipall(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 
 async def cb_review(query, action: str):
-    """callback dispatch：rev:skip / rev:pause"""
+    """callback dispatch：rev:read / rev:react / rev:pause"""
     chat_id = query.message.chat_id
     state = _review_state.get(chat_id)
     if not state:
         await query.answer("此 review 已過期", show_alert=True)
         return
 
-    if action == "skip":
+    if action == "read":
         h = state["pending"][state["idx"]]
         try:
             from kobo_highlights_reader import mark_processed
@@ -530,12 +550,22 @@ async def cb_review(query, action: str):
         except Exception as e:
             logger.warning(f"mark_processed 失敗: {e}")
         state["idx"] += 1
-        await query.answer("已跳過")
+        await query.answer("✓")
         try:
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
         await _push_review_card(chat_id, query.get_bot())
+        return
+
+    if action == "react":
+        state["awaiting_text"] = True
+        await query.answer()
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await query.message.reply_text("💭 打你的想法：")
         return
 
     if action == "pause":
@@ -774,7 +804,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group_id = update.message.media_group_id
 
     if not group_id:
-        # 單張：直接 process
+        # 單張：如果有暫存長文 → 合併模式
+        pending_text = _pending_long_text.pop(chat_id, None)
+        if pending_text:
+            if pending_text.get("task") and not pending_text["task"].done():
+                pending_text["task"].cancel()
+            await _process_text_with_screenshot(
+                chat_id, bot, pending_text["text"], img_bytes, caption,
+            )
+            return
+        # 否則當一般截圖 OCR 處理
         await _process_screenshots(chat_id, bot, [img_bytes], caption)
         return
 
@@ -800,9 +839,74 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending["task"] = asyncio.create_task(_finalize_media_group(group_id))
 
 
+async def _hold_long_text_for_screenshot(update: Update, text: str):
+    """長文暫存 2 分鐘等截圖。超時就直接走 article 摘要。"""
+    chat_id = update.effective_chat.id
+
+    # 取消上一個 pending
+    old = _pending_long_text.pop(chat_id, None)
+    if old and old.get("task") and not old["task"].done():
+        old["task"].cancel()
+
+    _pending_long_text[chat_id] = {
+        "text": text,
+        "update": update,
+        "task": asyncio.create_task(
+            _pending_text_timeout(chat_id, update, text),
+        ),
+    }
+    await update.message.reply_text(
+        "📝 收到長文。\n"
+        "📸 補一張截圖可以幫你抓發文者 / 平台資訊。\n"
+        "沒有的話 2 分鐘後直接摘要存起來。"
+    )
+
+
+async def _pending_text_timeout(chat_id: int, update: Update, text: str):
+    """2 分鐘沒補截圖 → 當一般長文處理。"""
+    await asyncio.sleep(PENDING_TEXT_TIMEOUT_SEC)
+    pending = _pending_long_text.pop(chat_id, None)
+    if not pending:
+        return
+    await _save_long_text_as_article(update, text)
+
+
+async def _process_text_with_screenshot(
+    chat_id: int, bot, text: str, image: bytes, caption: str,
+):
+    """長文 + 一張 metadata 截圖 → 合併成 post 存 vault。"""
+    progress = await bot.send_message(chat_id, "📝+📸 合併處理中...")
+    try:
+        from article_to_obsidian import save_text_with_metadata_screenshot
+        result = await asyncio.to_thread(
+            save_text_with_metadata_screenshot, text, image, caption,
+        )
+    except Exception as e:
+        logger.exception("text+screenshot combined failed")
+        try:
+            await progress.edit_text(f"❌ 合併處理失敗：{e}")
+        except Exception:
+            pass
+        return
+    poster_line = (
+        f"\n👤 {html_escape(result.get('poster', ''))}"
+        if result.get("poster") else ""
+    )
+    msg = (
+        f"✅ 已存進 Obsidian\n\n"
+        f"📝 <b>{html_escape(result.get('title', ''))}</b>"
+        f"{poster_line}\n"
+        f"📁 <code>{html_escape(result.get('remote_path', ''))}</code>"
+    )
+    try:
+        await progress.edit_text(msg, parse_mode=ParseMode.HTML)
+    except Exception:
+        await bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML)
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """所有非 command 純文字 dispatch。
-    優先序：review reaction → YouTube URL → 其他 URL（文章）→ 長文字（文章）→ 短文字（spark）。"""
+    優先序：review reaction → chat mode → URL → 長文字 → 短文字（spark）。"""
     if not update.message or not update.message.text:
         return
     chat_id = update.effective_chat.id
@@ -814,9 +918,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _process_reaction(update, context, state, text)
         return
 
-    # Priority 2: 多輪 chat 接續（user 在 /ask 啟動的對話中）
-    if chat_id in _chat_state:
-        await _continue_chat(update, text)
+    # Priority 2: discussion mode
+    if chat_id in _chat_mode:
+        if chat_id in _chat_state:
+            await _continue_chat(update, text)
+        else:
+            await _start_chat_with_question(update, text)
         return
 
     # Priority 3: YouTube URL → Gemini 看影片
@@ -831,9 +938,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _save_article_url(update, other_url)
         return
 
-    # Priority 4: 長文字（複製貼來的全文） → Gemini 摘要當文章
+    # Priority 4: 長文字 → 暫存等截圖，或直接摘要
     if len(text) >= SPARK_TEXT_LENGTH_THRESHOLD:
-        await _save_long_text_as_article(update, text)
+        await _hold_long_text_for_screenshot(update, text)
         return
 
     # Priority 5: 短文字 → spark 原樣存 Inbox
@@ -844,8 +951,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Daily digest
 # ─────────────────────────────────────────────
 
-async def daily_digest_loop(bot, chat_id: int):
-    """每天 DAILY_REVIEW_DIGEST_HOUR 點推送 pending 提醒。"""
+def _pick_daily_cards(pending: list, max_cards: int) -> list:
+    """從 pending 中挑最多 max_cards 張，同一本書的 highlight 連續排在一起。
+    pending 已按 (book_filename, timestamp) 排序。"""
+    if len(pending) <= max_cards:
+        return list(pending)
+    # 從第一本書開始拿，拿完再拿下一本，直到滿
+    cards: list = []
+    for h in pending:
+        cards.append(h)
+        if len(cards) >= max_cards:
+            break
+    return cards
+
+
+async def daily_review_loop(bot, chat_id: int):
+    """每天 DAILY_REVIEW_DIGEST_HOUR 點推送 highlight 回顧卡片（一張一張來、最多 10 張）。"""
     while True:
         now = datetime.now()
         target = now.replace(
@@ -854,24 +975,38 @@ async def daily_digest_loop(bot, chat_id: int):
         if now >= target:
             target += timedelta(days=1)
         sleep_secs = (target - now).total_seconds()
-        logger.info(f"daily digest 下次觸發於 {target}（{int(sleep_secs)}s 後）")
+        logger.info(f"daily review 下次觸發於 {target}（{int(sleep_secs)}s 後）")
         await asyncio.sleep(sleep_secs)
 
         try:
-            from kobo_highlights_reader import count_pending
-            count = await asyncio.to_thread(count_pending)
-            if count > 0:
-                await bot.send_message(
-                    chat_id,
-                    f"📚 你還有 <b>{count}</b> 條 highlights 沒 process。\n打 /review 開始。",
-                    parse_mode=ParseMode.HTML,
-                )
-            else:
-                logger.info("daily digest: 0 pending, 不推送")
+            if chat_id in _review_state:
+                logger.info("daily review: 已在 review 中，跳過")
+                continue
+
+            from kobo_highlights_reader import list_pending_highlights
+            pending = await asyncio.to_thread(list_pending_highlights)
+            if not pending:
+                logger.info("daily review: 0 pending, 不推送")
+                continue
+
+            cards = _pick_daily_cards(pending, DAILY_REVIEW_MAX_CARDS)
+            _review_state[chat_id] = {
+                "pending": cards,
+                "idx": 0,
+                "awaiting_text": False,
+                "current_msg_id": None,
+                "source": "daily",
+            }
+            remaining = len(pending) - len(cards)
+            msg = f"📚 今天的回顧 — {len(cards)} 條"
+            if remaining > 0:
+                msg += f"（還有 {remaining} 條待消化）"
+            await bot.send_message(chat_id, msg)
+            await _push_review_card(chat_id, bot)
         except Exception as e:
-            logger.exception(f"daily digest 失敗: {e}")
+            logger.exception(f"daily review 失敗: {e}")
             try:
-                await bot.send_message(chat_id, f"⚠️ daily digest 失敗：{e}")
+                await bot.send_message(chat_id, f"⚠️ daily review 失敗：{e}")
             except Exception:
                 pass
 
@@ -888,13 +1023,12 @@ def main():
 
     async def post_init(application: Application):
         await application.bot.set_my_commands([
-            BotCommand("review", "📚 process pending Kobo highlights"),
+            BotCommand("chat", "🧠 切換 discussion ↔ capture mode"),
+            BotCommand("review", "📚 手動 review 所有 pending highlights"),
             BotCommand("pausereview", "⏸ 暫停 review"),
             BotCommand("skipall", "🧹 把所有 pending 標記為已處理（清歷史用）"),
             BotCommand("quiz", "🎯 出一題 active recall（[書名關鍵字]）"),
             BotCommand("endquiz", "⏹ 取消當前 quiz"),
-            BotCommand("ask", "🧠 用整個 vault 當 context 開始對話"),
-            BotCommand("endchat", "💬 結束當前對話、寫摘要存 vault"),
             BotCommand("help", "❓ 用法說明"),
         ])
 
@@ -903,12 +1037,12 @@ def main():
         if chat_id_str:
             try:
                 chat_id = int(chat_id_str)
-                asyncio.create_task(daily_digest_loop(application.bot, chat_id))
-                logger.info(f"✅ daily digest task 啟動（每天 {DAILY_REVIEW_DIGEST_HOUR}:00 推送）")
+                asyncio.create_task(daily_review_loop(application.bot, chat_id))
+                logger.info(f"✅ daily review task 啟動（每天 {DAILY_REVIEW_DIGEST_HOUR}:00 推送）")
             except ValueError:
                 logger.warning(f"TELEGRAM_CHAT_ID 不是有效整數：{chat_id_str}，daily digest 跳過")
         else:
-            logger.warning("沒有 TELEGRAM_CHAT_ID，daily digest 跳過")
+            logger.warning("沒有 TELEGRAM_CHAT_ID，daily review 跳過")
 
     app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CallbackQueryHandler(handle_button))
@@ -919,6 +1053,7 @@ def main():
     app.add_handler(CommandHandler("skipall", cmd_skipall))
     app.add_handler(CommandHandler("quiz", cmd_quiz))
     app.add_handler(CommandHandler("endquiz", cmd_endquiz))
+    app.add_handler(CommandHandler("chat", cmd_chat))
     app.add_handler(CommandHandler("ask", cmd_ask))
     app.add_handler(CommandHandler("endchat", cmd_endchat))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))

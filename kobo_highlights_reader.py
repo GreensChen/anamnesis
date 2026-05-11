@@ -95,40 +95,36 @@ def parse_highlights_md(content: str, book_filename: str) -> list[Highlight]:
         if meta_lines:
             author = meta_lines[0]
 
-    # Body：以「timestamp line」當切割點。在 timestamp 之前累積的非空行 = 該 highlight 的 text。
-    # 章節行特徵：在 highlight block 之前單獨出現的一行（非 timestamp、非筆記、後面接 highlight 內容）。
-    # 但實作上：把累積的 buffer 在遇到 timestamp 時，視最後一行（如果跟 highlight 主體有空行隔開）為 chapter，
-    # 否則整 buffer 當 text。為保守正確，**不嘗試識別 chapter** — 把所有非 timestamp/非筆記行都當 text 一部分。
-    # 這樣即使 chapter 跟 text 黏在一起，highlight 仍完整保留 — 沒有資料遺失，下游若想分章再看。
-
     highlights: list[Highlight] = []
     buf_lines: list[str] = []
-    pending_note: Optional[str] = None
+    current_chapter: Optional[str] = None
 
     while i < len(lines):
         raw = lines[i]
         line = raw.strip()
-        # 移除尾部硬換行的 markdown 標記（兩空白）
-        # 注意：strip() 已經移除尾空白，line 是純內容
 
         if line == "":
-            # 空行 = 一段 highlight block 結束（如果 buf 有內容、且有 timestamp 已 flush）
             i += 1
             continue
 
         m = _TIMESTAMP_RE.match(line)
         if m:
-            # timestamp 行 → 把累積 buf 當 text
             ts = m.group(1)
-            text = "\n".join(s for s in buf_lines if s.strip()).strip()
+            # 從 buffer 中分離 chapter 行（如果有的話）
+            # 章節行 = buffer 首行、且 buffer ≥2 行、首行短且不像句尾
+            non_empty = [s for s in buf_lines if s.strip()]
+            if len(non_empty) >= 2 and _looks_like_chapter(non_empty[0]):
+                current_chapter = non_empty[0]
+                text = "\n".join(non_empty[1:]).strip()
+            else:
+                text = "\n".join(non_empty).strip()
             buf_lines = []
-            # 看下一行是不是「筆記：」
             note = None
             if i + 1 < len(lines):
                 next_line = lines[i + 1].strip()
                 if _NOTE_PREFIX_RE.match(next_line):
                     note = _NOTE_PREFIX_RE.sub("", next_line).strip()
-                    i += 1  # 多消耗一行
+                    i += 1
             if text:
                 highlights.append(Highlight(
                     book_filename=book_filename,
@@ -136,22 +132,32 @@ def parse_highlights_md(content: str, book_filename: str) -> list[Highlight]:
                     author=author,
                     text=text,
                     timestamp=ts,
+                    chapter=current_chapter,
                     note=note,
                 ))
             i += 1
             continue
 
         if _NOTE_PREFIX_RE.match(line):
-            # 「筆記：」自己一行但跟前一個 highlight 對不起來（理論上不會走到這，因為 timestamp 處理時會吃掉）
-            # 保險起見直接 skip
             i += 1
             continue
 
-        # 一般 text line，累積到 buffer
         buf_lines.append(line)
         i += 1
 
     return highlights
+
+
+_SENTENCE_ENDING = set("。.!?！？」）)…")
+
+
+def _looks_like_chapter(line: str) -> bool:
+    """章節標題 heuristic：短、不以句尾標點結束。"""
+    if len(line) > 80:
+        return False
+    if line and line[-1] in _SENTENCE_ENDING:
+        return False
+    return True
 
 
 # ─────────────────────────────────────────────

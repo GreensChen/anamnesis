@@ -13,10 +13,11 @@
 
 | 指令 | 行為 |
 |---|---|
-| `/review` | 從 Dropbox `/Kobo Highlights/` 抓未 process 的 highlight、一條一條卡片化。回覆文字 reaction 自動寫入 `0 Inbox/` |
+| `/chat` | 切換 discussion ↔ capture mode。帶問題（`/chat 我的盲點是什麼`）直接進 discussion + 發問。再打 `/chat` 結束、AI 寫摘要存 `2 Atomic Notes/Conversations/` |
+| `/review` | 手動 review 所有 pending Kobo highlights |
 | `/skipall` | 把所有 pending 標記為已處理（清歷史） |
 | `/quiz` | Active recall：從你某本書 / 訪談的 overview + highlights 出 3 選 1 題、答完存 `2 Atomic Notes/Quizzes/` |
-| `/ask <問題>` | 用整個 vault 當 context 對話、`/endchat` 結束時 AI 寫摘要、整段存 `2 Atomic Notes/Conversations/` |
+| 每天 22:00 | 自動推送 highlight 回顧卡片（最多 10 張、同一本書優先），「讀過了」或「補想法」逐張消化 |
 | 直接貼 YouTube URL | Gemini 看影片 → `1 Sources/Videos/<title>.md` |
 | 直接貼其他 URL | 抓網頁 + 摘要 → `1 Sources/Articles/<title>.md` |
 | 貼 1-3 張截圖 | OCR + 內容拼接 → `1 Sources/Articles/<title>.md` |
